@@ -1,0 +1,409 @@
+You are an AI developer agent. Your task: generate a production-quality Python MCP server that:
+
+Implements the MCP (Multi-Client-Process) architecture and conventions.
+
+Uses the py-MCP SDK for MCP boilerplate and lifecycle (assume mcp is the package name for the MCP helper/SDK).
+
+Communicates with clients over STDIO (JSON-lines protocol) using the MCP STDIO transport pattern.
+
+Uses the official Azure DevOps Python SDK (the azure.devops package / azure.devops.connection.Connection) to implement Azure DevOps actions.
+
+Exposes the list of tools and their exact input/output shapes (JSON) described in this prompt.
+
+Includes robust auth handling (PAT + OAuth optional), connection pooling, rate-limit handling, retries, and secure logging (no secrets in logs).
+
+Has unit tests and an integration test suite (mock ADO responses).
+
+Includes README and usage examples (starting server, example client requests, example STDIO JSON-lines).
+
+Constraints & principles (MCP best practices):
+
+Single responsibility: MCP server registers tools and executes them on request; it must not store long-term secrets or do UI tasks.
+
+Stateless tool handlers where possible; keep per-request context; allow optional connection caching keyed by connection_id.
+
+Deterministic JSON messages over STDIO. Each line is a JSON object. Each incoming message includes id, type, and payload.
+
+Tool registration: On startup, server must print a register_tools message describing available tools with metadata (name, description, inputs, outputs, examples).
+
+Tool invocation: Accept messages with type: "tool_call" and respond with streaming type: "tool_response" messages and a final type: "tool_result".
+
+Errors: Return structured error objects with code, message, details and map ADO API errors to user-friendly codes.
+
+Timeouts: Each call must enforce a per-tool timeout (configurable), so server never blocks STDIO indefinitely.
+
+Security: Do not leak PATs or tokens in logs or in responses. Use ephemeral connection IDs or token refs.
+
+Idempotency: For create operations, allow optional client_request_id to deduplicate.
+
+Transport & message format (STDIO JSON-lines):
+
+Incoming client messages (one JSON object per line):
+
+
+{
+  "id": "uuid-v4",
+  "type": "tool_call",
+  "tool": "wit_get_work_items",
+  "connection": { "connection_id": "conn1", "pat": null, "pat_ref": null, "org": "https://dev.azure.com/myorg", "project": "MyProj" },
+  "payload": {
+    /* tool-specific parameters */
+  },
+  "meta": {
+    "client_request_id": "optional",
+    "timeout_seconds": 60
+  }
+}
+Outgoing server messages (one JSON object per line):
+
+Registration at startup:
+
+
+{ "type": "register_tools", "id": "startup", "tools": [ { "name": "wit_get_work_items", "description": "...", "inputs": {...}, "outputs": {...} }, ... ] }
+Streaming progress / logs:
+
+
+{ "id": "uuid", "type": "tool_response", "event": "progress", "message": "searching ADO query...", "ts":"2025-08-10T12:00:00Z" }
+Final result:
+
+
+{ "id": "uuid", "type": "tool_result", "status": "success", "result": { /* tool result JSON */ } }
+Error:
+
+
+{ "id": "uuid", "type": "tool_result", "status": "error", "error": { "code":"ADO_401","message":"Unauthorized", "details": "PAT expired" } }
+Authentication & connections:
+
+Support two auth modes:
+
+PAT (personal access token) supplied in connection.pat or provided earlier via a connect tool that returns a connection_id to be reused.
+
+OAuth flow (optional): Provide a connect_oauth tool scaffold that returns connection_id. For OAuth include guidance in README; do not implement an external webserver for OAuth in first pass.
+
+Connection caching: In-memory LRU cache mapping connection_id→azure.devops.connection.Connection instance. Evict after configurable TTL. Never persist PATs to disk unless explicitly configured and encrypted; prefer ephemeral memory storage.
+
+Permissions: When PAT lacks permission, return clear error code ADO_403_PERMISSION.
+
+Azure DevOps SDK usage:
+
+Use from azure.devops.connection import Connection and from msrest.authentication import BasicAuthentication.
+
+For clients: wit_client = connection.clients.get_work_item_tracking_client(), test_client = connection.clients.get_test_client(), etc.
+
+Implement safe paging for queries (top, skip) and option to return either full objects or minimal summaries.
+
+Tool definitions
+(For each tool: input schema, behavior, output schema, examples)
+
+wit_get_work_items
+
+Purpose: search for work items with optional filters.
+
+Inputs (payload):
+
+
+{
+  "project": "optional",
+  "filters": {
+    "assigned_to": "user@example.com",
+    "state": "Active",
+    "area_path": "Project\\Component",
+    "iteration_path": "Project\\Iteration\\Sprint 1",
+    "work_item_type": "Bug",
+    "created_date_from": "2025-01-01T00:00:00Z",
+    "created_date_to": "2025-08-01T00:00:00Z",
+    "closed_date_from": "...",
+    "closed_date_to": "...",
+    "start_date": "...", /* custom field or tag depending on setup */
+    "target_date": "...",
+    "tags": ["ui","urgent"],
+    "top": 100,
+    "skip": 0,
+    "fields": ["System.Id","System.Title","System.State","System.AssignedTo"]
+  },
+  "sort": { "field": "System.CreatedDate", "order":"desc" }
+}
+Behavior:
+
+Build a WIQL query from filters (use SELECT [System.Id] FROM WorkItems WHERE ...).
+
+Use the work item tracking client to run WIQL, then fetch full items in batches.
+
+Output:
+
+
+{ "total": 123, "items": [ { "id": 123, "title":"...", "state":"Active", "assigned_to":"...", "fields": {...} }, ... ] }
+smart_work_item_search
+
+Inputs:
+
+
+{ "project":"MyProj", "query":"show me open critical bugs assigned to john in the payments area", "top":50 }
+Behavior:
+
+Convert natural language to WIQL using a small built-in mapping + optional lightweight NLP (keyword match). Provide a fallback that returns suggestions if ambiguous.
+
+(Optional) If LLM available, call local model with prompt to produce WIQL; otherwise use keyword parsing.
+
+Output same as wit_get_work_items.
+
+wit_get_work_item_by_title
+
+Inputs: { "project":"MyProj", "title":"Payment failure", "match_type":"contains" }
+
+Behavior: search for title contains or exact.
+
+Output: list of matching items.
+
+wit_get_work_item_by_areapath
+
+Inputs: { "project":"MyProj", "area_paths":["Project\\Area1","Project\\Area2"], "top":200 }
+
+Behavior: WIQL with System.AreaPath IN clause.
+
+wit_get_work_item_by_iterationpath
+
+Inputs similar to #4 but for System.IterationPath.
+
+wit_get_work_item_by_DateRange
+
+Inputs:
+
+
+{ "project":"MyProj", "date_field":"System.CreatedDate", "from":"2025-01-01T00:00:00Z", "to":"2025-02-01T00:00:00Z", "top":100 }
+Behavior: select items where date_field between from & to.
+
+wit_get_work_item_by_tags
+
+Inputs: { "project":"MyProj", "tags":["ui","release"], "match":"any" }
+
+Behavior: WIQL CONTAINS on System.Tags.
+
+wit_get_work_item_by_backlog
+
+Inputs: { "project":"MyProj", "backlog_level":"Epic|Feature|Requirement", "top":100 }
+
+Behavior: Query backlog work items by System.WorkItemType or backlog mapping.
+
+wit_get_work_item_by_teams
+
+Inputs: { "project":"MyProj", "team":"Team Name", "top":100 }
+
+Behavior: Resolve team default area/iteration and query.
+
+wit_get_work_item_by_query
+
+Inputs: { "project":"MyProj", "query_wiql":"SELECT ...", "top":100 }
+
+Behavior: run WIQL exactly.
+
+wit_get_work_item_by_query_id
+
+Inputs: { "project":"MyProj", "query_id":"GUID", "top":100 }
+
+Behavior: call query_by_id and fetch work items.
+
+wit_get_work_item_by_query_name
+
+Inputs: { "project":"MyProj", "query_name":"My Shared Query", "folder_path":"\\Shared Queries\\Folder" }
+
+create_work_item
+
+Inputs:
+
+
+{ "project":"MyProj", "work_item_type":"Bug", "fields": { "System.Title":"Title", "System.Description":"...", "Custom.TargetDate":"2025-09-01" }, "relations": [], "tags": ["x"] }
+Behavior: use wit_client.create_work_item(document, project, type) where document is a patch document in json-patch format. Return created id & url.
+
+wit_get_work_item_assigned_to
+
+Inputs: { "project":"MyProj", "work_item_id": 123 }
+
+Output: assigned-to user details.
+
+wit_work_item_link
+
+Inputs:
+
+
+{ "project":"MyProj", "source_id":100, "target_id":200, "link_type":"System.LinkTypes.Hierarchy-Forward" /* or "Related" */, "comment":"linking reason" }
+Behavior: create relation on source work item PATCH.
+
+wit_add_comments
+
+Inputs: { "project":"MyProj", "work_item_id":123, "comments": [ { "text":"note 1", "author":"me" } ] }
+
+Behavior: use work item comments API or patch with System.History.
+
+wit_add_tags
+
+Inputs: { "project":"MyProj", "work_item_id":123, "tags":["tag1","tag2"], "mode":"append" }
+
+Behavior: read existing tags, merge, patch System.Tags.
+
+wit_update_workitem
+
+Inputs: { "project":"MyProj", "work_item_id":123, "updates":{"System.State":"Closed","Custom.Priority":2} }
+
+Behavior: build json-patch and call update.
+
+wit_work_item_unlink
+
+Inputs: { "project":"MyProj", "source_id":100, "target_id":200, "link_type":"Related" }
+
+Behavior: remove relation.
+
+wit_add_child_work_items
+
+Inputs:
+
+
+{ "project":"MyProj", "parent_id":123, "children":[ { "work_item_type":"Task", "fields": {...} }, ... ] }
+Behavior: create each child and link to parent with System.LinkTypes.Hierarchy-Reverse/ forward depending on direction.
+
+Testplan tools (Test Management):
+
+testplan_create_test_plan
+
+Inputs: { "project":"MyProj", "name":"Plan Name", "area_path":"...", "iteration_path":"...", "start_date":"...", "end_date":"...", "owner":"user@org" }
+
+Behavior: use Test client (TestPlan API) to create test plan and return id/url.
+
+testplan_create_test_case
+
+Inputs: { "project":"MyProj", "test_case": { "title":"TC1", "steps":[ {"action":"...","expected":"..."} ], "area_path":"...", "iteration":"..." } }
+
+Behavior: create a Work Item of type Test Case or use Test API. Return ID and link.
+
+testplan_add_test_cases_to_suite
+
+Inputs: { "project":"MyProj", "plan_id":1, "suite_id":2, "test_case_ids":[100,101] }
+
+Behavior: use Test client method to add test cases to a suite.
+
+testplan_list_test_plans
+
+Inputs: { "project":"MyProj", "active_only": true, "top":50, "include_details": false }
+
+Output: paginated list.
+
+testplan_list_test_cases
+
+Inputs: { "project":"MyProj", "plan_id":1, "suite_id":2, "top":200 }
+
+testplan_show_test_results_from_build_id
+
+Inputs: { "project":"MyProj", "build_id": 1234, "top":100 }
+
+Behavior: query Test Results by build id (TestResults API).
+
+Implementation details & quality:
+
+Project structure:
+
+ruby
+Copy
+Edit
+mcp_ado/
+  server.py          # STDIO loop, registration, dispatch
+  tools/
+    __init__.py
+    wit.py           # implement WIT tools
+    testplan.py      # testplan related tools
+  ado/
+    connection_manager.py  # cache, connection factory
+    clients.py       # helper wrappers around azure.devops clients
+  utils/
+    wiql_builder.py
+    retry.py
+    validators.py
+  tests/
+    unit/
+    integration/     # use responses / requests-mock or azure-devops mocks
+  README.md
+  requirements.txt
+Use asyncio or thread pool for concurrency. Prefer asyncio with run_in_executor when calling blocking ADO client functions (which are typically sync).
+
+Implement graceful shutdown on SIGINT/SIGTERM with flush of inflight responses.
+
+Error handling:
+
+Map HTTP 401 → ADO_401, 403 → ADO_403, 429 → ADO_RATE_LIMIT, 500 → ADO_500.
+
+On 429, implement exponential backoff and retry (respect Retry-After header).
+
+Return partial success with error.details if some items failed during batch operations.
+
+Validation & schema:
+
+Validate all inputs using pydantic models (clear validation errors).
+
+Provide examples in the register_tools output (so clients can auto-generate UI forms).
+
+Testing:
+
+Include unit tests for wiql_builder and each tool's input validation.
+
+Include integration tests that spin up a fake STDIO client to send messages and assert outputs (mock azure.devops responses).
+
+Provide a local_client.py example that demonstrates connecting to the STDIO server and calling a tool.
+
+Logging & observability:
+
+Use structured JSON logs via structlog or logging with Formatter.
+
+Emit metrics (request latency, success/error counts) that can be hooked into Prometheus (optional).
+
+Deliverables:
+
+A single server.py that can be run python -m mcp_ado.server and will register tools to STDIO.
+
+tools/* modules implementing each tool with docstrings and unit tests.
+
+README with examples:
+
+Example startup log with register_tools JSON.
+
+Example STDIO tool_call for wit_get_work_items and expected tool_result.
+
+How to create a connection (PAT vs connect tool) and reuse connection_id.
+
+Postman/HTTP examples not required (STDIO only).
+
+Example minimal STDIO conversation (client → server):
+Client sends:
+
+
+{"id":"req-1","type":"tool_call","tool":"wit_get_work_items","connection":{"connection_id":"conn1","pat":"<REDACTED>","org":"https://dev.azure.com/myorg","project":"MyProj"},"payload":{"filters":{"assigned_to":"alice@example.com","state":"Active"}}, "meta": {"timeout_seconds":40}}
+Server responds (progress):
+
+
+{"id":"req-1","type":"tool_response","event":"progress","message":"building WIQL"}
+{"id":"req-1","type":"tool_response","event":"progress","message":"executing WIQL on Azure DevOps"}
+Server final:
+
+
+{"id":"req-1","type":"tool_result","status":"success","result":{"total":2,"items":[{"id":123,"title":"Bug A","state":"Active","assigned_to":"alice@example.com"}, {"id":456,"title":"Bug B","state":"Active","assigned_to":"alice@example.com"}]}}
+Security caveats & guidelines:
+
+Never return connection.pat in responses.
+
+If connection.pat is provided, mask it in logs (only show last 4 characters).
+
+Allow user to supply connection.pat_ref which is a reference token to secret store (optional hook), server should provide hooks to integrate with Vault/KV.
+
+Non-functional:
+
+Ensure average response time for simple queries is < 2s (network dependent).
+
+Memory usage: cache should be bounded.
+
+Concurrency: support at least 10 concurrent tool calls.
+
+Extras (nice-to-have):
+
+Provide openapi.json-style tool metadata in register_tools.
+
+Provide sample mcp_client.py which demonstrates reading/writing STDIO as a test harness.
+
+Option to run server with --no-color and --log-level flags.
