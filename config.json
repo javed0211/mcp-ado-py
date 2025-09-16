@@ -1,0 +1,7 @@
+{
+  "azure_devops": {
+    "default_organization": "https://dev.azure.com/your-organization",
+    "default_project": "your-project",
+    "pat_token": "your-azure-devops-pat-token-here"
+  }
+}
